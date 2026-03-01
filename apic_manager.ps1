@@ -14,6 +14,7 @@ $script:Config = @{
     BulkValidatePortPolicy = $true    # validate DPC/VPC policy groups on APIC
     BulkValidateTenant     = $true    # validate tenants on APIC
     BulkLookupEpg          = $true    # look up AP/EPG on APIC
+    DeployImmediate        = $true    # immediate or lazy deploy immediacy
 }
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -131,7 +132,7 @@ CREATE TABLE IF NOT EXISTS apic_hosts (
 INSERT OR IGNORE INTO db_meta (key,value) VALUES ('created_at', datetime('now'));
 INSERT OR IGNORE INTO db_meta (key,value) VALUES ('version',    '1.3');
 CREATE TABLE IF NOT EXISTS bulk_imports (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          TEXT PRIMARY KEY,
     file_name   TEXT,
     file_path   TEXT,
     imported_at TEXT DEFAULT (datetime('now')),
@@ -139,22 +140,24 @@ CREATE TABLE IF NOT EXISTS bulk_imports (
     status      TEXT DEFAULT 'pending'
 );
 CREATE TABLE IF NOT EXISTS bulk_import_rows (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    import_id   INTEGER REFERENCES bulk_imports(id),
-    src_line    INTEGER,
-    tenant      TEXT,
-    type        TEXT,
-    pod         TEXT,
-    leaf        TEXT,
-    port        TEXT,
-    vlan        INTEGER,
-    mode        TEXT,
-    native_vlan INTEGER,
-    ap          TEXT,
-    epg         TEXT,
-    valid       INTEGER DEFAULT 1,
-    errors      TEXT,
-    created_at  TEXT DEFAULT (datetime('now'))
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id     TEXT REFERENCES bulk_imports(id),
+    src_line      INTEGER,
+    tenant        TEXT,
+    type          TEXT,
+    pod           TEXT,
+    leaf          TEXT,
+    port          TEXT,
+    vlan          INTEGER,
+    mode          TEXT,
+    native_vlan   INTEGER,
+    ap            TEXT,
+    epg           TEXT,
+    valid         INTEGER DEFAULT 1,
+    errors        TEXT,
+    configured    INTEGER DEFAULT 0,
+    configured_at TEXT,
+    created_at    TEXT DEFAULT (datetime('now'))
 );
 "@
     try { Invoke-SqliteQuery -DataSource $script:DbPath -Query $sql | Out-Null }
@@ -185,6 +188,87 @@ CREATE TABLE IF NOT EXISTS bulk_import_rows (
             try { Invoke-SqliteQuery -DataSource $script:DbPath -Query $m.sql | Out-Null } catch {}
         }
     }
+
+    # ── Migrate bulk tables: INTEGER id → TEXT (UUID), add configured cols ──────
+    # PSSQLite cannot run multi-statement SQL, so each DDL/DML is a separate call.
+    try {
+        $biIdType = ''
+        $pragmaRows = @(Invoke-SqliteQuery -DataSource $script:DbPath `
+            -Query "PRAGMA table_info(bulk_imports)" -ErrorAction SilentlyContinue)
+        foreach ($pr in $pragmaRows) {
+            if ($pr.name -eq 'id') { $biIdType = [string]$pr.type; break }
+        }
+
+        if ($biIdType -and $biIdType -notlike 'TEXT*') {
+            # ── bulk_imports: rename old, create TEXT-keyed, copy, drop old ────
+            Invoke-SqliteQuery -DataSource $script:DbPath `
+                -Query "ALTER TABLE bulk_imports RENAME TO bulk_imports_old" | Out-Null
+            Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+CREATE TABLE bulk_imports (
+    id TEXT PRIMARY KEY, file_name TEXT, file_path TEXT,
+    imported_at TEXT DEFAULT (datetime('now')),
+    row_count INTEGER, status TEXT DEFAULT 'pending'
+)
+"@ | Out-Null
+            Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+INSERT OR IGNORE INTO bulk_imports
+    SELECT CAST(id AS TEXT),file_name,file_path,imported_at,row_count,status
+    FROM bulk_imports_old
+"@ | Out-Null
+            Invoke-SqliteQuery -DataSource $script:DbPath `
+                -Query "DROP TABLE IF EXISTS bulk_imports_old" | Out-Null
+
+            # ── bulk_import_rows: rename old, create new, copy, drop old ──────
+            Invoke-SqliteQuery -DataSource $script:DbPath `
+                -Query "ALTER TABLE bulk_import_rows RENAME TO bulk_import_rows_old" | Out-Null
+            Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+CREATE TABLE bulk_import_rows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id TEXT REFERENCES bulk_imports(id),
+    src_line INTEGER, tenant TEXT, type TEXT, pod TEXT, leaf TEXT, port TEXT,
+    vlan INTEGER, mode TEXT, native_vlan INTEGER, ap TEXT, epg TEXT,
+    valid INTEGER DEFAULT 1, errors TEXT,
+    configured INTEGER DEFAULT 0, configured_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+)
+"@ | Out-Null
+            # Check old table columns
+            $oldCols = @(Invoke-SqliteQuery -DataSource $script:DbPath `
+                -Query "PRAGMA table_info(bulk_import_rows_old)" -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.name })
+            if ($oldCols -contains 'configured') {
+                Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+INSERT OR IGNORE INTO bulk_import_rows
+    SELECT id,CAST(import_id AS TEXT),src_line,tenant,type,pod,leaf,port,
+           vlan,mode,native_vlan,ap,epg,valid,errors,configured,configured_at,created_at
+    FROM bulk_import_rows_old
+"@ | Out-Null
+            } else {
+                Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+INSERT OR IGNORE INTO bulk_import_rows
+    SELECT id,CAST(import_id AS TEXT),src_line,tenant,type,pod,leaf,port,
+           vlan,mode,native_vlan,ap,epg,valid,errors,0,NULL,created_at
+    FROM bulk_import_rows_old
+"@ | Out-Null
+            }
+            Invoke-SqliteQuery -DataSource $script:DbPath `
+                -Query "DROP TABLE IF EXISTS bulk_import_rows_old" | Out-Null
+        } else {
+            # Schema already TEXT — only add configured columns if missing
+            $rowCols = @(Invoke-SqliteQuery -DataSource $script:DbPath `
+                -Query "PRAGMA table_info(bulk_import_rows)" -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.name })
+            if ($rowCols.Count -gt 0 -and $rowCols -notcontains 'configured') {
+                Invoke-SqliteQuery -DataSource $script:DbPath `
+                    -Query "ALTER TABLE bulk_import_rows ADD COLUMN configured INTEGER DEFAULT 0" | Out-Null
+                Invoke-SqliteQuery -DataSource $script:DbPath `
+                    -Query "ALTER TABLE bulk_import_rows ADD COLUMN configured_at TEXT" | Out-Null
+            }
+        }
+    } catch {
+        Write-Host "  ⚠  Schema migration warning: $_" -ForegroundColor DarkYellow
+    }
+
     return $true
 }
 
@@ -201,6 +285,7 @@ function Save-Config {
         bulk_validate_port_policy  = [string]($script:Config.BulkValidatePortPolicy)
         bulk_validate_tenant       = [string]($script:Config.BulkValidateTenant)
         bulk_lookup_epg            = [string]($script:Config.BulkLookupEpg)
+        deploy_immediate           = [string]($script:Config.DeployImmediate)
     }
     foreach ($k in $pairs.Keys) {
         $v = $pairs[$k]
@@ -229,6 +314,7 @@ function Load-Config {
         if ($map['bulk_validate_port_policy']) { $script:Config.BulkValidatePortPolicy   = ($map['bulk_validate_port_policy'] -eq 'True') }
         if ($map['bulk_validate_tenant'])      { $script:Config.BulkValidateTenant       = ($map['bulk_validate_tenant'] -eq 'True') }
         if ($map['bulk_lookup_epg'])           { $script:Config.BulkLookupEpg            = ($map['bulk_lookup_epg'] -eq 'True') }
+        if ($map['deploy_immediate'])          { $script:Config.DeployImmediate           = ($map['deploy_immediate'] -eq 'True') }
         if ($map['db_folder'] -and (Test-Path $map['db_folder'])) {
             $script:DbFolder = $map['db_folder']
             $script:DbPath   = Join-Path $script:DbFolder $script:DbFile
@@ -513,21 +599,29 @@ function Write-ConfigSummary {
     $pref = Get-PreferredHost
     $pv2 = if ($cnt -gt 0) { "$cnt controller(s) — preferred: $(if($pref){$pref}else{'none (random)'})" } else { "none yet" }
 
-    Write-Host "  ┌──────────────────────────────────────────────┐" -ForegroundColor DarkGray
+    $infLbl = if ($script:Config.InputFolder) { $script:Config.InputFolder } else { "(not set)" }
+    $diLbl2 = if ($script:Config.ContainsKey('DeployImmediate') -and -not $script:Config.DeployImmediate) { "lazy" } else { "immediate" }
+    $auLbl2 = if ($script:Config.AutoUpdate) { "enabled" } else { "disabled" }
+    $w = 34
+    Write-Host "  ┌──────────────────────────────────────────────────┐" -ForegroundColor DarkGray
     foreach ($row in @(
-        @{L="Bootstrap ";V=$hv;C="Cyan"}
-        @{L="Host Pool ";V=$pv2;C="DarkYellow"}
-        @{L="Username  ";V=$uv;C="Cyan"}
-        @{L="Password  ";V=$pv;C="Cyan"}
-        @{L="SSL Verify";V=$sv;C=$sc}
-        @{L="Session   ";V=$ssv;C=$ssc}
-        @{L="DB Path   ";V=$db;C="DarkYellow"}
+        @{L="Bootstrap    ";V=$hv;C="Cyan"}
+        @{L="Host Pool    ";V=$pv2;C="DarkYellow"}
+        @{L="Username     ";V=$uv;C="Cyan"}
+        @{L="Password     ";V=$pv;C="Cyan"}
+        @{L="SSL Verify   ";V=$sv;C=$sc}
+        @{L="Session      ";V=$ssv;C=$ssc}
+        @{L="DB Path      ";V=$db;C="DarkYellow"}
+        @{L="Input Folder ";V=$infLbl;C="Gray"}
+        @{L="Deploy immed.";V=$diLbl2;C="Gray"}
+        @{L="Auto-update  ";V=$auLbl2;C="Gray"}
     )) {
+        $val = if ($row.V.Length -gt $w) { $row.V.Substring(0,$w-3)+'...' } else { $row.V.PadRight($w) }
         Write-Host "  │  $($row.L): " -NoNewline -ForegroundColor DarkGray
-        Write-Host $row.V.PadRight(31) -NoNewline -ForegroundColor $row.C
+        Write-Host $val -NoNewline -ForegroundColor $row.C
         Write-Host "│" -ForegroundColor DarkGray
     }
-    Write-Host "  └──────────────────────────────────────────────┘" -ForegroundColor DarkGray
+    Write-Host "  └──────────────────────────────────────────────────┘" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -1630,8 +1724,11 @@ function Invoke-AutoUpdate {
         $remoteTag  = $rel.tag_name -replace '^v',''
         $localVer   = $script:AppVersion
 
+        # Always show the remote version in the header after first successful check
+        $script:AppVersion = $remoteTag   # update to reflect GitHub's reality
+
         if ($remoteTag -eq $localVer) {
-            Write-Host " ✔  up to date (v$localVer)" -ForegroundColor Green
+            Write-Host " ✔  v$remoteTag (up to date)" -ForegroundColor Green
             return
         }
 
@@ -1696,7 +1793,7 @@ function Invoke-ApicPortPolicyValidation {
     # Collect unique (port, type, tenant) combos that need checking
     $checks = @{}
     foreach ($r in $Rows) {
-        if ($r.type -eq 'dpc' -or $r.type -eq 'vpc') {
+        if ($r.type -eq 'port_channel' -or $r.type -eq 'dpc' -or $r.type -eq 'vpc') {
             $ck = "$($r.port)|$($r.type)|$($r.tenant)"
             if (-not $checks.ContainsKey($ck)) {
                 $checks[$ck] = @{ port=$r.port; type=$r.type; tenant=$r.tenant }
@@ -1782,7 +1879,7 @@ public class TrustAllPPV : ICertificatePolicy {
                 $port   = $ck.port
                 $type   = $ck.type
                 $tenant = $ck.tenant
-                $lagT   = if ($type -eq 'dpc') { 'link' } else { 'node' }
+                $lagT   = if ($type -eq 'port_channel' -or $type -eq 'dpc') { 'link' } else { 'node' }
 
                 if (-not $grpMap.ContainsKey($port)) {
                     $results[$ckKey] = @{ Valid=$false; Message="policy group '$port' not found on APIC" }
@@ -1830,30 +1927,16 @@ public class TrustAllPPV : ICertificatePolicy {
 
 function Show-BulkAdvancedSettings {
     while (-not $script:ExitRequested) {
-        $vpLbl  = if ($script:Config.BulkValidatePortPolicy) { "enabled ✔" } else { "disabled ✘" }
-        $tvLbl  = if ($script:Config.BulkValidateTenant -ne $false) { "enabled ✔" } else { "disabled ✘" }
-        $epLbl  = if ($script:Config.BulkLookupEpg -ne $false)      { "enabled ✔" } else { "disabled ✘" }
-
+        if (-not $script:Config.ContainsKey('DeployImmediate')) { $script:Config['DeployImmediate'] = $true }
+        $diLbl = if ($script:Config.DeployImmediate) { "immediate ✔" } else { "lazy ○" }
         $items = @(
-            "Validate port policy (DPC/VPC)  — $vpLbl"
-            "Validate tenant on APIC         — $tvLbl"
-            "Lookup AP/EPG on APIC           — $epLbl"
+            "Deploy immediacy — $diLbl"
         )
         $sel = Invoke-Menu -Title "⚙  Bulk Advanced Settings  " -Color "Green" -Items $items
         $backIdx = $items.Count; $backMainIdx = $items.Count + 1; $quitIdx = $items.Count + 2
         switch ($sel) {
             0 {
-                $script:Config.BulkValidatePortPolicy = -not $script:Config.BulkValidatePortPolicy
-                Save-Config
-            }
-            1 {
-                if ($script:Config.BulkValidateTenant -ne $false) { $script:Config.BulkValidateTenant = $false }
-                else { $script:Config.BulkValidateTenant = $true }
-                Save-Config
-            }
-            2 {
-                if ($script:Config.BulkLookupEpg -ne $false) { $script:Config.BulkLookupEpg = $false }
-                else { $script:Config.BulkLookupEpg = $true }
+                $script:Config.DeployImmediate = -not $script:Config.DeployImmediate
                 Save-Config
             }
             $backIdx     { return }
@@ -2040,18 +2123,14 @@ public class TrustAllEpg : ICertificatePolicy {
                     }
                     $r = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -TimeoutSec 20
                 }
-                $epgList = [System.Collections.Generic.List[object]]::new()
+                $epgList = @()
                 foreach ($item in $r.imdata) {
                     $dn  = $item.fvAEPg.attributes.dn
                     $epg = $item.fvAEPg.attributes.name
-                    # DN: uni/tn-<T>/ap-<AP>/epg-<EPG>
-                    if ($dn -match '/ap-([^/]+)/epg-') {
-                        $ap = $Matches[1]
-                    } else { $ap = '' }
-                    # EPG name starts with VLAN id: "2_Server_Farm" → vlan 2
+                    if ($dn -match '/ap-([^/]+)/epg-') { $ap = $Matches[1] } else { $ap = '' }
                     if ($epg -match '^(\d+)') {
-                        $vlan = [int]$Matches[1]
-                        $epgList.Add(@{ Vlan=$vlan; AP=$ap; EPG=$epg })
+                        $vlanInt = [int]$Matches[1]
+                        $epgList += @{ Vlan=$vlanInt; AP=$ap; EPG=$epg }
                     }
                 }
                 $allResults[$tenant] = $epgList
@@ -2211,8 +2290,15 @@ public class TrustAllBulkLogin : ICertificatePolicy {
         }
 
         # --- Type ------------------------------------------------------------
-        $type = $row['type'].ToLower()
-        if ($validTypes -notcontains $type) { $errs.Add("invalid type '$($row['type'])' (port/dpc/vpc)") }
+        $rawType = $row['type'].ToLower().Trim()
+        # Normalize CSV aliases to canonical APIC values
+        $typeMap = @{ 'port'='switch_port'; 'dpc'='port_channel'; 'vpc'='vpc' }
+        if ($typeMap.ContainsKey($rawType)) { $type = $typeMap[$rawType] }
+        else                               { $type = $rawType }
+        $validTypes = @('switch_port','port_channel','vpc','port','dpc')
+        if ($rawType -notin @('port','dpc','vpc','switch_port','port_channel')) {
+            $errs.Add("invalid type '$($row['type'])' — use port/dpc/vpc")
+        }
 
         # --- Pod -------------------------------------------------------------
         $podRaw = $row['pod']
@@ -2326,10 +2412,10 @@ public class TrustAllBulkLogin : ICertificatePolicy {
             if ($srow.valid -ne 1) { continue }
             $t = $srow.tenant
             if ($epgMap.ContainsKey($t)) {
-                foreach ($epgEntry in $epgMap[$t]) {
-                    if ($epgEntry.Vlan -eq $srow.vlan) {
-                        $srow.ap  = $epgEntry.AP
-                        $srow.epg = $epgEntry.EPG
+                foreach ($epgEntry in @($epgMap[$t])) {
+                    if ([int]($epgEntry.Vlan) -eq [int]($srow.vlan)) {
+                        $srow.ap  = [string]($epgEntry.AP)
+                        $srow.epg = [string]($epgEntry.EPG)
                         break
                     }
                 }
@@ -2341,13 +2427,13 @@ public class TrustAllBulkLogin : ICertificatePolicy {
     }
 
     # ── 5b. Validate DPC/VPC port policy groups ─────────────────────────────
-    $dpcVpcRows = @($serialized | Where-Object { $_.valid -eq 1 -and ($_.type -eq 'dpc' -or $_.type -eq 'vpc') })
+    $dpcVpcRows = @($serialized | Where-Object { $_.valid -eq 1 -and ($_.type -eq 'port_channel' -or $_.type -eq 'vpc') })
     if ($script:Session.LoggedIn -and $dpcVpcRows.Count -gt 0 -and $script:Config.BulkValidatePortPolicy) {
         Write-Host "  🔌  Validating DPC/VPC port policies..." -NoNewline -ForegroundColor DarkGray
         $ppResults = Invoke-ApicPortPolicyValidation -Rows $dpcVpcRows
         $ppFail = 0
         foreach ($srow in $serialized) {
-            if ($srow.type -ne 'dpc' -and $srow.type -ne 'vpc') { continue }
+            if ($srow.type -ne 'port_channel' -and $srow.type -ne 'vpc') { continue }
             if ($srow.valid -ne 1) { continue }
             $ckKey = "$($srow.port)|$($srow.type)|$($srow.tenant)"
             if ($ppResults.ContainsKey($ckKey) -and $ppResults[$ckKey].Valid -eq $false) {
@@ -2367,15 +2453,14 @@ public class TrustAllBulkLogin : ICertificatePolicy {
     # ── 6. Save to DB ────────────────────────────────────────────────────────
     Write-Host "  💾  Saving to database..." -NoNewline -ForegroundColor DarkGray
     Initialize-Database | Out-Null
-    $fileName   = Split-Path $FilePath -Leaf
-    $validCount = ($serialized | Where-Object { $_.valid -eq 1 }).Count
+    $fileName    = Split-Path $FilePath -Leaf
+    $validCount  = ($serialized | Where-Object { $_.valid -eq 1 }).Count
+    $importUuid  = [System.Guid]::NewGuid().ToString()
 
     Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
-INSERT INTO bulk_imports (file_name, file_path, row_count, status)
-VALUES (@fn, @fp, @rc, @st)
-"@ -SqlParameters @{ fn=$fileName; fp=$FilePath; rc=$serialized.Count; st='imported' } | Out-Null
-
-    $importId = (Invoke-SqliteQuery -DataSource $script:DbPath -Query "SELECT last_insert_rowid() AS id").id
+INSERT INTO bulk_imports (id, file_name, file_path, row_count, status)
+VALUES (@uid, @fn, @fp, @rc, @st)
+"@ -SqlParameters @{ uid=$importUuid; fn=$fileName; fp=$FilePath; rc=$serialized.Count; st='imported' } | Out-Null
 
     foreach ($srow in $serialized) {
         Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
@@ -2384,13 +2469,14 @@ INSERT INTO bulk_import_rows
 VALUES
     (@iid,@sl,@te,@ty,@po,@le,@pr,@vl,@mo,@nv,@ap,@ep,@va,@er)
 "@ -SqlParameters @{
-            iid=$importId; sl=$srow.src_line; te=$srow.tenant; ty=$srow.type
-            po=$srow.pod;  le=$srow.leaf;    pr=$srow.port;   vl=$srow.vlan
-            mo=$srow.mode; nv=$srow.native_vlan; ap=$srow.ap; ep=$srow.epg
-            va=$srow.valid; er=$srow.errors
+            iid=$importUuid; sl=$srow.src_line; te=$srow.tenant; ty=$srow.type
+            po=$srow.pod;    le=$srow.leaf;     pr=$srow.port;   vl=$srow.vlan
+            mo=$srow.mode;   nv=$srow.native_vlan; ap=$srow.ap;  ep=$srow.epg
+            va=$srow.valid;  er=$srow.errors
         } | Out-Null
     }
-    Write-Host " ✔  Import #$importId saved" -ForegroundColor Green
+    $shortUuid = $importUuid.Substring(0,8)
+    Write-Host " ✔  Import $shortUuid saved" -ForegroundColor Green
 
     Write-Host ""
     Write-Host "  ┌────────────────────────────────────┐" -ForegroundColor DarkGray
@@ -2402,7 +2488,7 @@ VALUES
         @{ L="After expand"; V="$($serialized.Count) rows" }
         @{ L="Valid rows "; V="$validCount" }
         @{ L="Invalid    "; V="$($serialized.Count - $validCount)" }
-        @{ L="Import ID  "; V="#$importId" }
+        @{ L="Import ID  "; V=$importUuid }
     )
     foreach ($sr in $sumRows) {
         Write-Host "  │  $($sr.L): " -NoNewline -ForegroundColor DarkGray
@@ -2414,7 +2500,7 @@ VALUES
     Write-Host "  Press any key to view results table..." -ForegroundColor DarkGray
     [Console]::ReadKey($true) | Out-Null
 
-    Show-BulkImportResults -ImportId $importId
+    Show-BulkImportResults -ImportUuid $importUuid
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2422,14 +2508,14 @@ VALUES
 # ════════════════════════════════════════════════════════════════════════════════
 
 function Show-BulkImportResults {
-    param([int]$ImportId)
+    param([string]$ImportUuid)
 
     # Load rows from DB
     try {
         $allRows = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
-SELECT id,src_line,tenant,type,pod,leaf,port,vlan,mode,native_vlan,ap,epg,valid,errors
+SELECT id,src_line,tenant,type,pod,leaf,port,vlan,mode,native_vlan,ap,epg,valid,errors,configured,configured_at
 FROM bulk_import_rows WHERE import_id=@iid ORDER BY src_line,vlan
-"@ -SqlParameters @{iid=$ImportId})
+"@ -SqlParameters @{iid=$ImportUuid})
     } catch {
         Clear-Host; Write-Header "📋  Import Results" "Green"
         Write-Host "  ✘  DB query error: $_" -ForegroundColor Red
@@ -2438,82 +2524,105 @@ FROM bulk_import_rows WHERE import_id=@iid ORDER BY src_line,vlan
 
     if ($allRows.Count -eq 0) {
         Clear-Host; Write-Header "📋  Import Results" "Green"
-        Write-Host "  ⚠  No rows found for import #$ImportId" -ForegroundColor DarkYellow
+        Write-Host "  ⚠  No rows found for import $($ImportUuid.Substring(0,8))..." -ForegroundColor DarkYellow
         Write-Host ""; Wait-AnyKey; return
     }
 
-    # Column widths
-    $wTenant = 14; $wType = 5; $wPod = 7; $wLeaf = 6
-    $wPort   = 8;  $wVlan = 6; $wMode = 8; $wAp = 14; $wEpg = 20
-    $tableInner = $wTenant+$wType+$wPod+$wLeaf+$wPort+$wVlan+$wMode+$wAp+$wEpg + 9
+    # ── Column layout: ☐ Tenant AP EPG Type Pod Leaf Port VLAN Mode ──────────
+    $wSel    = 2
+    $wTenant = 14; $wAp = 14; $wEpg = 20
+    $wType   = 5;  $wPod = 7; $wLeaf = 6; $wPort = 8; $wVlan = 6; $wMode = 8
+    $tableInner = $wSel+1+$wTenant+1+$wAp+1+$wEpg+1+$wType+1+$wPod+1+$wLeaf+1+$wPort+1+$wVlan+1+$wMode
 
-    $bL = "  ┌" + ('─' * $tableInner) + "┐"
-    $bM = "  ├" + ('─' * $tableInner) + "┤"
-    $bB = "  └" + ('─' * $tableInner) + "┘"
-    $hdr = "  │ " +
+    $bL  = "  ┌" + ('─' * $tableInner) + "┐"
+    $bM  = "  ├" + ('─' * $tableInner) + "┤"
+    $bB  = "  └" + ('─' * $tableInner) + "┘"
+    $hdr = "  │" + " ".PadRight($wSel+1) +
            "Tenant".PadRight($wTenant) + " " +
-           "Type".PadRight($wType)   + " " +
-           "Pod".PadRight($wPod)     + " " +
-           "Leaf".PadRight($wLeaf)   + " " +
-           "Port".PadRight($wPort)   + " " +
-           "VLAN".PadRight($wVlan)   + " " +
-           "Mode".PadRight($wMode)   + " " +
-           "AP".PadRight($wAp)       + " " +
-           "EPG".PadRight($wEpg)     + "│"
+           "AP".PadRight($wAp)         + " " +
+           "EPG".PadRight($wEpg)       + " " +
+           "Type".PadRight($wType)     + " " +
+           "Pod".PadRight($wPod)       + " " +
+           "Leaf".PadRight($wLeaf)     + " " +
+           "Port".PadRight($wPort)     + " " +
+           "VLAN".PadRight($wVlan)     + " " +
+           "Mode".PadRight($wMode)     + "│"
 
-    $pageSize = 18   # rows visible at once
-    $offset   = 0
-    $showInvalid = $false   # invalid rows hidden by default
+    $pageSize    = 15
+    $offset      = 0
+    $cursor      = 0          # index within $viewRows for current highlight
+    $showInvalid = $false
+    $selected    = @{}        # row DB id → $true when checked
+
+    $shortId = $ImportUuid.Substring(0,8)
 
     [Console]::CursorVisible = $false
     try {
         while ($true) {
-            # Filter
+            # ── Build view ────────────────────────────────────────────────────
             if ($showInvalid) { $viewRows = $allRows }
             else              { $viewRows = @($allRows | Where-Object { $_.valid -eq 1 }) }
 
             $total = $viewRows.Count
-            $page  = $viewRows | Select-Object -Skip $offset -First $pageSize
+            if ($total -eq 0) { $cursor = 0 }
+            elseif ($cursor -ge $total) { $cursor = $total - 1 }
 
-            # ── Draw ─────────────────────────────────────────────────────────
-            Clear-Host
-            Write-Host ""
-            Write-Host "  ╔══════════════════════════════════╗" -ForegroundColor Green
-            Write-Host "  ║  📋  Import Results  #$($ImportId.ToString().PadRight(9))║" -ForegroundColor Green
-            Write-Host "  ╚══════════════════════════════════╝" -ForegroundColor Green
-            Write-Host ""
+            # Keep cursor on screen: adjust offset
+            if ($cursor -lt $offset)              { $offset = $cursor }
+            if ($cursor -ge $offset + $pageSize)  { $offset = $cursor - $pageSize + 1 }
+
+            $page = $viewRows | Select-Object -Skip $offset -First $pageSize
 
             $validCnt   = ($allRows | Where-Object { $_.valid -eq 1 }).Count
             $invalidCnt = $allRows.Count - $validCnt
-            $filterLbl  = if ($showInvalid) { "all ($total)" } else { "valid only ($total)" }
+            $selCnt     = ($selected.Keys | Where-Object { $selected[$_] }).Count
 
-            Write-Host "  Rows: " -NoNewline -ForegroundColor DarkGray
-            Write-Host "$($allRows.Count) total" -NoNewline -ForegroundColor Cyan
-            Write-Host "   ✔ $validCnt valid" -NoNewline -ForegroundColor Green
-            if ($invalidCnt -gt 0) { Write-Host "   ✘ $invalidCnt invalid" -NoNewline -ForegroundColor Red }
-            Write-Host "   Filter: $filterLbl" -ForegroundColor DarkGray
-            Write-Host "  ↑↓/PgUp/PgDn scroll   F toggle invalid rows   Esc back" -ForegroundColor DarkGray
+            # ── Draw header ───────────────────────────────────────────────────
+            Clear-Host
+            Write-Host ""
+            Write-Host "  ╔══════════════════════════════════╗" -ForegroundColor Green
+            Write-Host "  ║  📋  Import Results $($shortId.PadRight(13))║" -ForegroundColor Green
+            Write-Host "  ╚══════════════════════════════════╝" -ForegroundColor Green
             Write-Host ""
 
+            Write-Host "  " -NoNewline
+            Write-Host "$($allRows.Count) total" -NoNewline -ForegroundColor Cyan
+            Write-Host "  ✔ $validCnt valid" -NoNewline -ForegroundColor Green
+            if ($invalidCnt -gt 0) { Write-Host "  ✘ $invalidCnt invalid" -NoNewline -ForegroundColor Red }
+            Write-Host "  ☑ $selCnt selected" -ForegroundColor DarkYellow
+            if ($showInvalid) { $filterLbl = "all" } else { $filterLbl = "valid only" }
+            Write-Host "  ↑↓ move   Space=select   A=all   F=toggle invalid($filterLbl)   Enter=confirm   Esc=back" -ForegroundColor DarkGray
+            Write-Host ""
+
+            # ── Draw table ────────────────────────────────────────────────────
             Write-Host $bL -ForegroundColor DarkGray
             Write-Host $hdr -ForegroundColor DarkGray
             Write-Host $bM -ForegroundColor DarkGray
 
+            $pageIdx = 0
             foreach ($r in $page) {
-                $isValid = ($r.valid -eq 1)
+                $absIdx  = $offset + $pageIdx
+                $isCursor = ($absIdx -eq $cursor)
+                $isChecked = ($selected.ContainsKey($r.id) -and $selected[$r.id])
+                $isValid  = ($r.valid -eq 1)
+                $pageIdx++
 
-                $tenantC = if ($isValid) { 'Cyan'  } else { 'DarkYellow' }
-                $rowColor = if ($isValid) { 'Gray'  } else { 'DarkYellow' }
+                # Checkbox glyph
+                $isCfg = ($r.PSObject.Properties.Name -contains 'configured' -and $r.configured -eq 1)
+                if ($isChecked)  { $chk = '☑' }
+                elseif ($isCfg) { $chk = '✔' }
+                else            { $chk = '☐' }
 
-                $tTenant = if ($r.tenant.Length -gt $wTenant) { $r.tenant.Substring(0,$wTenant-1)+'…' } else { $r.tenant.PadRight($wTenant) }
-                $tType   = $r.type.PadRight($wType)
-                $tPod    = $r.pod.PadRight($wPod)
-                $tLeaf   = $r.leaf.PadRight($wLeaf)
-                $tPort   = $r.port.PadRight($wPort)
-                $tVlan   = $r.vlan.ToString().PadRight($wVlan)
-                $tMode   = $r.mode.PadRight($wMode)
-                $tAp     = if ($r.ap.Length  -gt $wAp)  { $r.ap.Substring(0,$wAp-1)+'…'  } else { $r.ap.PadRight($wAp)   }
-                $tEpg    = if ($r.epg.Length -gt $wEpg) { $r.epg.Substring(0,$wEpg-1)+'…' } else { $r.epg.PadRight($wEpg) }
+                # Truncate / pad cells
+                if ($r.tenant.Length -gt $wTenant) { $tTenant = $r.tenant.Substring(0,$wTenant-1)+'…' } else { $tTenant = $r.tenant.PadRight($wTenant) }
+                if ($r.ap.Length     -gt $wAp)     { $tAp     = $r.ap.Substring(0,$wAp-1)+'…'         } else { $tAp     = $r.ap.PadRight($wAp)     }
+                if ($r.epg.Length    -gt $wEpg)    { $tEpg    = $r.epg.Substring(0,$wEpg-1)+'…'        } else { $tEpg    = $r.epg.PadRight($wEpg)    }
+                $tType  = $r.type.PadRight($wType)
+                $tPod   = $r.pod.PadRight($wPod)
+                $tLeaf  = $r.leaf.PadRight($wLeaf)
+                $tPort  = $r.port.PadRight($wPort)
+                $tVlan  = $r.vlan.ToString().PadRight($wVlan)
+                $tMode  = $r.mode.PadRight($wMode)
 
                 $modeColor = switch ($r.mode) {
                     'native'  { 'DarkYellow' }
@@ -2522,57 +2631,157 @@ FROM bulk_import_rows WHERE import_id=@iid ORDER BY src_line,vlan
                     'regular' { 'Gray' }
                     default   { 'Gray' }
                 }
+                if ($isValid)  { $tenantColor = 'Cyan' }       else { $tenantColor = 'DarkYellow' }
+                if ($r.ap)     { $apColor     = 'DarkCyan' }   else { $apColor     = 'DarkGray' }
+                if ($r.epg)    { $epgColor    = 'DarkCyan' }   else { $epgColor    = 'DarkGray' }
+                if ($isValid)  { $vlanColor   = 'Yellow' }     else { $vlanColor   = 'DarkYellow' }
+                if ($isChecked){ $chkColor    = 'Yellow' }     else { $chkColor    = 'DarkGray' }
 
-                if ($isValid) { $vlanColor = 'Yellow' } else { $vlanColor = 'DarkYellow' }
-                if ($r.ap)    { $apColor   = 'DarkCyan' } else { $apColor   = 'DarkGray' }
-                if ($r.epg)   { $epgColor  = 'DarkCyan' } else { $epgColor  = 'DarkGray' }
+                if ($isCursor) {
+                    # Highlighted row: full cyan background
+                    Write-Host "  │ $chk $tTenant $tAp $tEpg $tType $tPod $tLeaf $tPort $tVlan $tMode│" -BackgroundColor DarkBlue -ForegroundColor White
+                } else {
+                    Write-Host "  │" -NoNewline -ForegroundColor DarkGray
+                    Write-Host " $chk" -NoNewline -ForegroundColor $chkColor
+                    Write-Host " $tTenant" -NoNewline -ForegroundColor $tenantColor
+                    Write-Host " $tAp"     -NoNewline -ForegroundColor $apColor
+                    Write-Host " $tEpg"    -NoNewline -ForegroundColor $epgColor
+                    Write-Host " $tType"   -NoNewline -ForegroundColor Gray
+                    Write-Host " $tPod"    -NoNewline -ForegroundColor DarkGray
+                    Write-Host " $tLeaf"   -NoNewline -ForegroundColor DarkGray
+                    Write-Host " $tPort"   -NoNewline -ForegroundColor Gray
+                    Write-Host " $tVlan"   -NoNewline -ForegroundColor $vlanColor
+                    Write-Host " $tMode"   -NoNewline -ForegroundColor $modeColor
+                    Write-Host "│" -ForegroundColor DarkGray
+                }
 
-                Write-Host "  │ " -NoNewline -ForegroundColor DarkGray
-                Write-Host $tTenant -NoNewline -ForegroundColor $tenantC
-                Write-Host " $tType "  -NoNewline -ForegroundColor $rowColor
-                Write-Host "$tPod "    -NoNewline -ForegroundColor $rowColor
-                Write-Host "$tLeaf "   -NoNewline -ForegroundColor $rowColor
-                Write-Host "$tPort "   -NoNewline -ForegroundColor $rowColor
-                Write-Host "$tVlan "   -NoNewline -ForegroundColor $vlanColor
-                Write-Host "$tMode "   -NoNewline -ForegroundColor $modeColor
-                Write-Host "$tAp "     -NoNewline -ForegroundColor $apColor
-                Write-Host "$tEpg"     -NoNewline -ForegroundColor $epgColor
-                Write-Host "│" -ForegroundColor DarkGray
-
-                # Show error note if invalid
+                # Error line below invalid rows
                 if (-not $isValid -and $r.errors) {
-                    if ($r.errors.Length -gt $tableInner - 4) {
-                        $errShort = $r.errors.Substring(0, $tableInner - 7) + '...'
-                    } else {
-                        $errShort = $r.errors
-                    }
-                    Write-Host "  │  ✘ $($errShort.PadRight($tableInner - 4))│" -ForegroundColor Red
+                    $maxE = $tableInner - 5
+                    if ($r.errors.Length -gt $maxE) { $errShort = $r.errors.Substring(0,$maxE-3)+'...' }
+                    else                            { $errShort = $r.errors }
+                    Write-Host "  │  ✘ $($errShort.PadRight($maxE))│" -ForegroundColor Red
                 }
             }
 
             Write-Host $bB -ForegroundColor DarkGray
             Write-Host ""
-            $pageNum  = [math]::Floor($offset / $pageSize) + 1
-            $pageTot  = [math]::Max(1, [math]::Ceiling($total / $pageSize))
-            Write-Host "  Page $pageNum / $pageTot   (rows $($offset+1)–$([math]::Min($offset+$pageSize,$total)) of $total)" -ForegroundColor DarkGray
+            $pageNum = [math]::Floor($offset / $pageSize) + 1
+            $pageTot = [math]::Max(1, [math]::Ceiling($total / $pageSize))
+            Write-Host "  Row $($cursor+1)/$total   Page $pageNum/$pageTot" -ForegroundColor DarkGray
             Write-Host ""
-            Write-Host "  ────────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host "  ─────────────────────────────────────────────────" -ForegroundColor DarkGray
+            if ($selCnt -gt 0) {
+                Write-Host "  [Enter] ✔ Configure $selCnt selected row(s)   " -NoNewline -ForegroundColor Green
+            } else {
+                Write-Host "  [Enter] ✔ Configure selected (none yet)       " -NoNewline -ForegroundColor DarkGray
+            }
             Write-Host "  [Esc] Back" -ForegroundColor DarkGray
 
+            # ── Key handling ─────────────────────────────────────────────────
             $key = [Console]::ReadKey($true)
+
             switch ($key.Key) {
-                'Escape'   { return }
-                'UpArrow'  { if ($offset -gt 0) { $offset -= 1 } }
-                'DownArrow'{ if ($offset + $pageSize -lt $total) { $offset += 1 } }
-                'PageUp'   { $offset = [math]::Max(0, $offset - $pageSize) }
+                'Escape' { return }
+
+                'UpArrow' {
+                    if ($cursor -gt 0) { $cursor-- }
+                }
+                'DownArrow' {
+                    if ($cursor -lt $total - 1) { $cursor++ }
+                }
+                'PageUp' {
+                    $cursor = [math]::Max(0, $cursor - $pageSize)
+                }
                 'PageDown' {
-                    if ($offset + $pageSize -lt $total) {
-                        $offset = [math]::Min($total - 1, $offset + $pageSize)
+                    $cursor = [math]::Min($total - 1, $cursor + $pageSize)
+                }
+
+                'Spacebar' {
+                    if ($total -gt 0) {
+                        $rid = $viewRows[$cursor].id
+                        if ($selected.ContainsKey($rid) -and $selected[$rid]) {
+                            $selected[$rid] = $false
+                        } else {
+                            $selected[$rid] = $true
+                        }
                     }
                 }
-                'F' {
-                    $showInvalid = -not $showInvalid
-                    $offset = 0
+
+                'Enter' {
+                    $toProcess = @($viewRows | Where-Object {
+                        $selected.ContainsKey($_.id) -and $selected[$_.id]
+                    })
+                    if ($toProcess.Count -gt 0) {
+                        [Console]::CursorVisible = $true
+                        Clear-Host
+                        Write-Header "🔗  Configure Static Ports — curl commands" "Green"
+                        Write-Host "  $($toProcess.Count) row(s) selected" -ForegroundColor Cyan
+                        Write-Host ""
+
+                        $h_ = if ($script:Session.LoggedIn) { $script:Session.Host }  else { '<APIC-HOST>' }
+                        $t_ = if ($script:Session.LoggedIn) { $script:Session.Token } else { '<TOKEN>' }
+
+                        Write-Host "  # Run these commands on a machine with curl to apply the configuration:" -ForegroundColor DarkGray
+                        Write-Host ""
+
+                        $curls = @()
+                        foreach ($pr in $toProcess) {
+                            $cmd = Format-ApicCurl -Row $pr -Host_ $h_ -Token $t_
+                            $curls += $cmd
+                            Write-Host "  $cmd" -ForegroundColor Yellow
+                            Write-Host ""
+                        }
+
+                        Write-Host "  ─────────────────────────────────" -ForegroundColor DarkGray
+                        Write-Host "  [C] Copy to clipboard   [Esc] Back without marking configured" -ForegroundColor DarkGray
+                        Write-Host "  [Enter] Mark rows as configured and save" -ForegroundColor Green
+
+                        $act = [Console]::ReadKey($true)
+                        if ($act.KeyChar -eq 'c' -or $act.KeyChar -eq 'C') {
+                            $curls -join "`n" | Set-Clipboard -ErrorAction SilentlyContinue
+                            Write-Host "  ✔  Copied to clipboard!" -ForegroundColor Green
+                            Start-Sleep -Milliseconds 700
+                        } elseif ($act.Key -eq 'Enter') {
+                            $now = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                            foreach ($pr in $toProcess) {
+                                try {
+                                    Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+UPDATE bulk_import_rows SET configured=1, configured_at=@ca WHERE id=@rid
+"@ -SqlParameters @{ca=$now; rid=$pr.id} | Out-Null
+                                } catch {}
+                            }
+                            # Reload allRows to reflect configured status
+                            $allRows = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+SELECT id,src_line,tenant,type,pod,leaf,port,vlan,mode,native_vlan,ap,epg,valid,errors,configured,configured_at
+FROM bulk_import_rows WHERE import_id=@iid ORDER BY src_line,vlan
+"@ -SqlParameters @{iid=$ImportUuid})
+                            Write-Host "  ✔  $($toProcess.Count) row(s) marked as configured." -ForegroundColor Green
+                            Start-Sleep -Milliseconds 700
+                        }
+
+                        $selected = @{}
+                        [Console]::CursorVisible = $false
+                    }
+                }
+
+                default {
+                    $ch = $key.KeyChar
+                    # A = select all / deselect all (toggle)
+                    if ($ch -eq 'a' -or $ch -eq 'A') {
+                        $validIds = @($viewRows | Where-Object { $_.valid -eq 1 } | ForEach-Object { $_.id })
+                        $allChosen = ($validIds | Where-Object { -not ($selected.ContainsKey($_) -and $selected[$_]) }).Count -eq 0
+                        if ($allChosen) {
+                            foreach ($rid in $validIds) { $selected[$rid] = $false }
+                        } else {
+                            foreach ($rid in $validIds) { $selected[$rid] = $true }
+                        }
+                    }
+                    # F = toggle show invalid
+                    if ($ch -eq 'f' -or $ch -eq 'F') {
+                        $showInvalid = -not $showInvalid
+                        $cursor = 0; $offset = 0
+                    }
                 }
             }
         }
@@ -2580,30 +2789,36 @@ FROM bulk_import_rows WHERE import_id=@iid ORDER BY src_line,vlan
         [Console]::CursorVisible = $true
     }
 }
-
 function Invoke-BulkStaticPort {
-    # Ensure input folder is configured before entering the TUI
-    if (-not $script:Config.InputFolder -or -not (Test-Path $script:Config.InputFolder)) {
-        Clear-Host; Write-Header "🔗  Bulk add static ports" "Green"
-        Write-Host "  ⚠  Input folder not configured or not found." -ForegroundColor DarkYellow
-        Write-Host ""
-        Write-Host "  Set it now? [Y/N] : " -NoNewline -ForegroundColor DarkGray
-        $yn = [Console]::ReadKey($true); Write-Host $yn.KeyChar
-        if ($yn.Key -eq 'Y') {
-            Set-InputFolder
-        } else {
-            Write-Host ""; Wait-AnyKey; return
-        }
-        # After Set-InputFolder, re-check — user may have cancelled inside it
-        if (-not $script:Config.InputFolder -or -not (Test-Path $script:Config.InputFolder)) {
-            Write-Host "  ⚠  Input folder still not set. Returning." -ForegroundColor DarkYellow
-            Write-Host ""; Wait-AnyKey; return
-        }
-    }
+    while ($true) {
+        $folderOk  = $script:Config.InputFolder -and (Test-Path $script:Config.InputFolder)
+        $folderLbl = if ($folderOk) { $script:Config.InputFolder } else { "(not set)" }
+        $diLbl3    = if ($script:Config.ContainsKey('DeployImmediate') -and -not $script:Config.DeployImmediate) { 'lazy' } else { 'immediate' }
 
-    $file = Select-BulkFile
-    if ($file) {
-        Import-BulkCsv -FilePath $file
+        $menuItems = @(
+            "Select file from input folder — $folderLbl"
+            "Change input folder"
+            "Advanced settings (deploy: $diLbl3)"
+        )
+        $sel = Invoke-Menu -Title "🔗  Bulk static port — import" -Color "Green" -Items $menuItems
+        $backIdx = $menuItems.Count; $backMainIdx = $menuItems.Count+1; $quitIdx = $menuItems.Count+2
+        switch ($sel) {
+            0 {
+                if (-not $folderOk) {
+                    Clear-Host; Write-Header "🔗  Bulk add static ports" "Green"
+                    Write-Host "  ⚠  Input folder not set. Please configure it first." -ForegroundColor DarkYellow
+                    Write-Host ""; Wait-AnyKey
+                } else {
+                    $file = Select-BulkFile
+                    if ($file) { Import-BulkCsv -FilePath $file }
+                }
+            }
+            1 { Set-InputFolder }
+            2 { Show-BulkAdvancedSettings }
+            $backIdx     { return }
+            $backMainIdx { $script:ReturnToMain = $true; return }
+            $quitIdx     { Invoke-Quit; return }
+        }
     }
 }
 
@@ -2627,22 +2842,147 @@ function Show-EndpointGroupsMenu {
     }
 }
 
-function Show-ShowMenu {
-    $items=@("Show Tenants","Show VRFs","Show BDs","Show EPGs")
+# ════════════════════════════════════════════════════════════════════════════════
+#  VERIFY — IMPORT HISTORY + CONFIGURE
+# ════════════════════════════════════════════════════════════════════════════════
+
+function Format-ApicCurl {
+    # Generates curl commands for a single serialized row
+    param([object]$Row, [string]$Host_, [string]$Token)
+    $deployMode = if ($script:Config.ContainsKey('DeployImmediate') -and -not $script:Config.DeployImmediate) { 'lazy' } else { 'immediate' }
+    $encapVlan  = "vlan-$($Row.vlan)"
+    $modeStr    = $Row.mode
+    $tenantStr  = $Row.tenant
+    $epgStr     = $Row.epg
+    $apStr      = $Row.ap
+    $pod        = $Row.pod
+    $leaf       = $Row.leaf
+    $port       = $Row.port
+    $type       = $Row.type
+
+    # Path depends on type
+    if ($type -eq 'switch_port' -or $type -eq 'port') {
+        $pathDn  = "topology/$pod/paths-$leaf/pathep-[$port]"
+        $pathType = 'pathep'
+    } elseif ($type -eq 'port_channel' -or $type -eq 'dpc') {
+        $pathDn  = "topology/$pod/paths-$leaf/pathep-[$port]"
+        $pathType = 'pathep'
+    } else {
+        # vpc
+        $pathDn  = "topology/$pod/protpaths-$leaf/pathep-[$port]"
+        $pathType = 'protpathep'
+    }
+
+    $dn   = "uni/tn-$tenantStr/ap-$apStr/epg-$epgStr/rspathAtt-[$pathDn]"
+    $body = '{"fvRsPathAtt":{"attributes":{"dn":"' + $dn + '","encap":"' + $encapVlan + '","mode":"' + $modeStr + '","instrImedcy":"' + $deployMode + '","tDn":"' + $pathDn + '"}}}'
+    $url  = "https://$Host_/api/node/mo/$dn.json"
+    $cmd  = "curl -sk -X POST -H 'Cookie: APIC-cookie=$Token' -H 'Content-Type: application/json' -d '$body' '$url'"
+    return $cmd
+}
+
+function Show-ImportHistory {
+    # Show table of all past imports; select one to drill into rows
+    try {
+        $imports = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+SELECT id, file_name, file_path, imported_at, row_count, status
+FROM bulk_imports ORDER BY imported_at DESC
+"@)
+    } catch {
+        Clear-Host; Write-Header "📂  Import History" "Cyan"
+        Write-Host "  ✘  DB error: $_" -ForegroundColor Red
+        Write-Host ""; Wait-AnyKey; return
+    }
+
+    if ($imports.Count -eq 0) {
+        Clear-Host; Write-Header "📂  Import History" "Cyan"
+        Write-Host "  ⚠  No imports found. Run a bulk import first." -ForegroundColor DarkYellow
+        Write-Host ""; Wait-AnyKey; return
+    }
+
+    $cursor  = 0
+    $wId     = 10;  $wFile = 28; $wPath = 30; $wDate = 19; $wRows = 6; $wSt = 10
+    $tInner  = $wId + 1 + $wFile + 1 + $wPath + 1 + $wDate + 1 + $wRows + 1 + $wSt
+    $bL = "  ┌" + ('─' * $tInner) + "┐"
+    $bM = "  ├" + ('─' * $tInner) + "┤"
+    $bB = "  └" + ('─' * $tInner) + "┘"
+    $hdr = "  │ " + "ID".PadRight($wId) + " " + "File".PadRight($wFile) + " " +
+           "Path".PadRight($wPath) + " " + "Date".PadRight($wDate) + " " +
+           "Rows".PadRight($wRows) + " " + "Status".PadRight($wSt) + "│"
+
+    [Console]::CursorVisible = $false
+    try {
+        while ($true) {
+            Clear-Host
+            Write-Host ""
+            Write-Host "  ╔══════════════════════════════════╗" -ForegroundColor Cyan
+            Write-Host "  ║  📂  Import History              ║" -ForegroundColor Cyan
+            Write-Host "  ╚══════════════════════════════════╝" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "  ↑↓ navigate   Enter=open   Esc=back" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host $bL -ForegroundColor DarkGray
+            Write-Host $hdr -ForegroundColor DarkGray
+            Write-Host $bM -ForegroundColor DarkGray
+
+            for ($i = 0; $i -lt $imports.Count; $i++) {
+                $r = $imports[$i]
+                $sId   = $r.id.Substring(0,[math]::Min($wId-1,$r.id.Length)) + $(if($r.id.Length -gt $wId){'…'}else{''})
+                $sId   = $sId.PadRight($wId)
+                $sFn   = if ($r.file_name.Length -gt $wFile) { $r.file_name.Substring(0,$wFile-1)+'…' } else { $r.file_name.PadRight($wFile) }
+                $sFp   = if ($r.file_path.Length -gt $wPath) { '...'+$r.file_path.Substring($r.file_path.Length-$wPath+3) } else { $r.file_path.PadRight($wPath) }
+                $sDt   = $r.imported_at.PadRight($wDate)
+                $sRw   = $r.row_count.ToString().PadRight($wRows)
+                $sSt   = $r.status.PadRight($wSt)
+                if ($i -eq $cursor) {
+                    Write-Host "  │ $sId $sFn $sFp $sDt $sRw $sSt│" -BackgroundColor DarkBlue -ForegroundColor White
+                } else {
+                    Write-Host "  │ " -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$sId " -NoNewline -ForegroundColor DarkYellow
+                    Write-Host "$sFn " -NoNewline -ForegroundColor Cyan
+                    Write-Host "$sFp " -NoNewline -ForegroundColor Gray
+                    Write-Host "$sDt " -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$sRw " -NoNewline -ForegroundColor Yellow
+                    Write-Host "$sSt" -NoNewline -ForegroundColor Gray
+                    Write-Host "│" -ForegroundColor DarkGray
+                }
+            }
+
+            Write-Host $bB -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "  ─────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host "  [Enter] Open   [Esc] Back" -ForegroundColor DarkGray
+
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                'Escape'    { return }
+                'UpArrow'   { if ($cursor -gt 0) { $cursor-- } }
+                'DownArrow' { if ($cursor -lt $imports.Count - 1) { $cursor++ } }
+                'Enter'     {
+                    [Console]::CursorVisible = $true
+                    Show-BulkImportResults -ImportUuid $imports[$cursor].id
+                    [Console]::CursorVisible = $false
+                }
+            }
+        }
+    } finally {
+        [Console]::CursorVisible = $true
+    }
+}
+
+function Show-VerifyMenu {
+    $items = @("Verify previous bulk static port imports")
     while (-not $script:ExitRequested) {
-        $sel = Invoke-Menu -Title "👁  Show                   " -Color "Cyan" -Items $items
+        $sel = Invoke-Menu -Title "🔍  Verify                 " -Color "Cyan" -Items $items
         $backIdx = $items.Count; $backMainIdx = $items.Count + 1; $quitIdx = $items.Count + 2
         switch ($sel) {
-            0{Clear-Host;Write-Header "👁  Show Tenants" "Cyan";Write-Host "  → Logic here" -ForegroundColor Yellow;Wait-AnyKey}
-            1{Clear-Host;Write-Header "👁  Show VRFs"   "Cyan";Write-Host "  → Logic here" -ForegroundColor Yellow;Wait-AnyKey}
-            2{Clear-Host;Write-Header "👁  Show BDs"    "Cyan";Write-Host "  → Logic here" -ForegroundColor Yellow;Wait-AnyKey}
-            3{Clear-Host;Write-Header "👁  Show EPGs"   "Cyan";Write-Host "  → Logic here" -ForegroundColor Yellow;Wait-AnyKey}
+            0 { Show-ImportHistory; if ($script:ReturnToMain) { return } }
             $backIdx     { return }
             $backMainIdx { $script:ReturnToMain = $true; return }
             $quitIdx     { Invoke-Quit; return }
         }
     }
 }
+
 
 function Show-TroubleshootMenu {
     $items=@("Check Faults","Check Connectivity","Ping Endpoint","Show Logs")
@@ -2690,6 +3030,7 @@ function Show-SettingsMenu {
             "Change DB Folder    ─ $dbS"
             "Input Folder for bulk operation ─ $inputLbl"
             "Auto-update from GitHub ─ $auLbl"
+            "Update now          ─ 🔄 check GitHub immediately"
             "Clean Database      ─ 🗄 clear or delete DB"
         )
         $dis = @()
@@ -2714,7 +3055,16 @@ function Show-SettingsMenu {
             7  { Set-DbFolder }
             8  { Set-InputFolder }
             9  { $script:Config.AutoUpdate = -not $script:Config.AutoUpdate; Save-Config }
-            10 { Clear-Database }
+            10 {
+                Clear-Host; Write-Header "🔄  Update Now" "DarkYellow"
+                Write-Host "  Checking GitHub for updates..." -ForegroundColor DarkGray
+                Write-Host ""
+                Invoke-AutoUpdate
+                Write-Host ""
+                Write-Host "  (If up to date, nothing happens.)" -ForegroundColor DarkGray
+                Write-Host ""; Wait-AnyKey
+            }
+            11 { Clear-Database }
             $backIdx     { return }
             $backMainIdx { $script:ReturnToMain = $true; return }
             $quitIdx     { Invoke-Quit; return }
@@ -2727,11 +3077,11 @@ function Show-SettingsMenu {
 # ════════════════════════════════════════════════════════════════════════════════
 
 function Show-MainMenu {
-    $items = @("Configure","Show","Troubleshoot","Settings","Quit")
+    $items = @("Configure","Verify","Troubleshoot","Settings","Quit")
     while (-not $script:ExitRequested) {
         $script:ReturnToMain = $false
-        switch (Invoke-Menu -Title "🌐  APIC Manager v1.4      " -Color "Cyan" -Items $items -IsMain $true) {
-            0 { Show-ConfigureMenu }; 1 { Show-ShowMenu }
+        switch (Invoke-Menu -Title "🌐  APIC Manager v$($script:AppVersion)    " -Color "Cyan" -Items $items -IsMain $true) {
+            0 { Show-ConfigureMenu }; 1 { Show-VerifyMenu }
             2 { Show-TroubleshootMenu }; 3 { Show-SettingsMenu }; 4 { Invoke-Quit }
         }
     }
@@ -2744,7 +3094,7 @@ function Show-MainMenu {
 Clear-Host
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "  ║   🌐  APIC Manager v1.4          ║" -ForegroundColor Cyan
+Write-Host "  ║   🌐  APIC Manager                ║" -ForegroundColor Cyan
 Write-Host "  ║   🚀  Starting up...             ║" -ForegroundColor Cyan
 Write-Host "  ╚══════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
