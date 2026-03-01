@@ -1,14 +1,19 @@
-# ── Cisco APIC Manager v1.3 ───────────────────────────────────────────────────
+# ── Cisco APIC Manager v1.4 ───────────────────────────────────────────────────
 
 $script:ExitRequested = $false
+$script:AppVersion    = '1.4'      # used for GitHub update check
 
 # ── Global config ─────────────────────────────────────────────────────────────
 $script:Config = @{
-    ApicHost    = $null
-    Username    = $null
-    Password    = $null
-    SSLVerify   = $true
-    InputFolder = $null
+    ApicHost               = $null
+    Username               = $null
+    Password               = $null
+    SSLVerify              = $true
+    InputFolder            = $null
+    AutoUpdate             = $true    # check GitHub for new version on startup
+    BulkValidatePortPolicy = $true    # validate DPC/VPC policy groups on APIC
+    BulkValidateTenant     = $true    # validate tenants on APIC
+    BulkLookupEpg          = $true    # look up AP/EPG on APIC
 }
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -191,7 +196,11 @@ function Save-Config {
         password   = Protect-String $script:Config.Password
         ssl_verify = [string]($script:Config.SSLVerify)
         db_folder  = $script:DbFolder
-        input_folder = if ($script:Config.InputFolder) { $script:Config.InputFolder } else { $null }
+        input_folder               = if ($script:Config.InputFolder) { $script:Config.InputFolder } else { $null }
+        auto_update                = [string]($script:Config.AutoUpdate)
+        bulk_validate_port_policy  = [string]($script:Config.BulkValidatePortPolicy)
+        bulk_validate_tenant       = [string]($script:Config.BulkValidateTenant)
+        bulk_lookup_epg            = [string]($script:Config.BulkLookupEpg)
     }
     foreach ($k in $pairs.Keys) {
         $v = $pairs[$k]
@@ -215,7 +224,11 @@ function Load-Config {
         if ($map['username'])   { $script:Config.Username  = Unprotect-String $map['username']  }
         if ($map['password'])   { $script:Config.Password  = Unprotect-String $map['password']  }
         if ($map['ssl_verify']) { $script:Config.SSLVerify = ($map['ssl_verify'] -eq 'True')    }
-        if ($map['input_folder']) { $script:Config.InputFolder = $map['input_folder'] }
+        if ($map['input_folder'])              { $script:Config.InputFolder              = $map['input_folder'] }
+        if ($map['auto_update'])               { $script:Config.AutoUpdate               = ($map['auto_update'] -eq 'True') }
+        if ($map['bulk_validate_port_policy']) { $script:Config.BulkValidatePortPolicy   = ($map['bulk_validate_port_policy'] -eq 'True') }
+        if ($map['bulk_validate_tenant'])      { $script:Config.BulkValidateTenant       = ($map['bulk_validate_tenant'] -eq 'True') }
+        if ($map['bulk_lookup_epg'])           { $script:Config.BulkLookupEpg            = ($map['bulk_lookup_epg'] -eq 'True') }
         if ($map['db_folder'] -and (Test-Path $map['db_folder'])) {
             $script:DbFolder = $map['db_folder']
             $script:DbPath   = Join-Path $script:DbFolder $script:DbFile
@@ -1399,10 +1412,10 @@ function Select-BulkFile {
             if ($focus -eq 'filter') { $focusMark = '►' } else { $focusMark = ' ' }
 
             if ($focus -eq 'filter') {
-                $hint     = '  Printable=filter  Backspace=erase  Tab/Enter/↓=list  Esc=cancel'
+                $hint     = '  Printable=filter  Backspace=erase  Tab/Enter/↓=list  O=change folder  Esc=cancel'
                 $lblColor = 'White'
             } else {
-                $hint     = '  ↑↓=navigate  Enter=select  Tab/↑top=filter  Esc=cancel'
+                $hint     = '  ↑↓=navigate  Enter=select  Tab/↑top=filter  O=change folder  Esc=cancel'
                 $lblColor = 'DarkGray'
             }
 
@@ -1468,6 +1481,21 @@ function Select-BulkFile {
             $key = [Console]::ReadKey($true)
 
             if ($key.Key -eq 'Escape') { return $null }
+
+            # O = change input folder (available in both focus modes)
+            if ($key.KeyChar -eq 'o' -or $key.KeyChar -eq 'O') {
+                [Console]::CursorVisible = $true
+                Set-InputFolder
+                [Console]::CursorVisible = $false
+                # Reload folder from config
+                if ($script:Config.InputFolder -and (Test-Path $script:Config.InputFolder)) {
+                    $folder = $script:Config.InputFolder
+                } else {
+                    $folder = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+                }
+                $filter = ''; $selected = 0; $focus = 'filter'
+                continue
+            }
 
             if ($focus -eq 'filter') {
                 switch ($key.Key) {
@@ -1578,6 +1606,261 @@ function Clear-Database {
         default { Write-Host "  ⚠  Cancelled." -ForegroundColor DarkGray }
     }
     Write-Host ""; Wait-AnyKey
+}
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  GITHUB AUTO-UPDATE
+# ════════════════════════════════════════════════════════════════════════════════
+
+function Invoke-AutoUpdate {
+    # Checks GitHub releases API for a newer version. Downloads and restarts if found.
+    if (-not $script:Config.AutoUpdate) { return }
+    if (-not $PSCommandPath)            { return }   # can't restart if path unknown
+
+    Write-Host "  🔄  Checking for updates..." -NoNewline -ForegroundColor DarkGray
+    try {
+        $apiUrl   = 'https://api.github.com/repos/apellini/APIC-MANAGER/releases/latest'
+        $headers  = @{ 'User-Agent' = 'APIC-Manager-Updater' }
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            $rel = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 10 -ErrorAction Stop
+        } else {
+            $rel = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 10 -ErrorAction Stop
+        }
+        $remoteTag  = $rel.tag_name -replace '^v',''
+        $localVer   = $script:AppVersion
+
+        if ($remoteTag -eq $localVer) {
+            Write-Host " ✔  up to date (v$localVer)" -ForegroundColor Green
+            return
+        }
+
+        Write-Host " ℹ  new version v$remoteTag available (current v$localVer)" -ForegroundColor Cyan
+
+        # Find .ps1 asset in release
+        $asset = $rel.assets | Where-Object { $_.name -like '*.ps1' } | Select-Object -First 1
+        if (-not $asset) {
+            # Fallback: raw main branch
+            $downloadUrl = "https://raw.githubusercontent.com/apellini/APIC-MANAGER/main/APIC_manager.ps1"
+        } else {
+            $downloadUrl = $asset.browser_download_url
+        }
+
+        Write-Host "  📥  Downloading v$remoteTag..." -NoNewline -ForegroundColor DarkGray
+        $tmpFile = [System.IO.Path]::GetTempFileName() + '.ps1'
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -TimeoutSec 30 -ErrorAction Stop
+        } else {
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers['User-Agent'] = 'APIC-Manager-Updater'
+            $wc.DownloadFile($downloadUrl, $tmpFile)
+        }
+        Write-Host " ✔" -ForegroundColor Green
+
+        # Verify download looks like a PowerShell script
+        $firstLine = Get-Content $tmpFile -TotalCount 1 -ErrorAction Stop
+        if ($firstLine -notlike '*APIC*' -and $firstLine -notlike '#*') {
+            Write-Host "  ✘  Downloaded file looks invalid — update aborted." -ForegroundColor Red
+            Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+            return
+        }
+
+        # Replace current script and restart
+        Copy-Item -Path $tmpFile -Destination $PSCommandPath -Force
+        Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+        Write-Host "  ✔  Script updated. Restarting..." -ForegroundColor Green
+        Start-Sleep -Milliseconds 800
+        & powershell.exe -NoLogo -NoProfile -File $PSCommandPath
+        exit
+    } catch {
+        Write-Host " ⚠  Update check failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  APIC PORT POLICY VALIDATION  (DPC / VPC)
+# ════════════════════════════════════════════════════════════════════════════════
+
+function Invoke-ApicPortPolicyValidation {
+    # For each row with type=dpc or type=vpc:
+    #  1. Check interface policy group exists (infraAccBndlGrp with lagT=link for dpc, lagT=node for vpc)
+    #  2. If found, check that attached AEP has a VLAN domain starting with the tenant name
+    # Returns hashtable: "leaf|port|vlan|tenant" → @{Valid=$bool; Message=string}
+    param([object[]]$Rows)
+
+    if (-not $script:Session.LoggedIn) { return @{} }
+    $token = $script:Session.Token
+    $host_ = $script:Session.Host
+    $ssl   = $script:Session.SSLVerify
+
+    # Collect unique (port, type, tenant) combos that need checking
+    $checks = @{}
+    foreach ($r in $Rows) {
+        if ($r.type -eq 'dpc' -or $r.type -eq 'vpc') {
+            $ck = "$($r.port)|$($r.type)|$($r.tenant)"
+            if (-not $checks.ContainsKey($ck)) {
+                $checks[$ck] = @{ port=$r.port; type=$r.type; tenant=$r.tenant }
+            }
+        }
+    }
+    if ($checks.Count -eq 0) { return @{} }
+
+    $job = Start-Job -ScriptBlock {
+        param($host_, $token, $ssl, $checksJson)
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $checks = $checksJson | ConvertFrom-Json
+
+        function ApicGet($url, $tok, $h, $ssl) {
+            $hdr = @{ Cookie = "APIC-cookie=$tok" }
+            if ($PSVersionTable.PSVersion.Major -ge 7) {
+                $p = @{Uri=$url;Method='GET';Headers=$hdr;TimeoutSec=20}
+                if (-not $ssl) { $p['SkipCertificateCheck']=$true }
+                return Invoke-RestMethod @p
+            } else {
+                if (-not $ssl) {
+                    if (-not ([System.Management.Automation.PSTypeName]'TrustAllPPV').Type) {
+                        Add-Type @"
+using System.Net; using System.Security.Cryptography.X509Certificates;
+public class TrustAllPPV : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp,X509Certificate c,WebRequest req,int p){return true;} }
+"@
+                    }
+                    [Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllPPV
+                }
+                return Invoke-RestMethod -Uri $url -Method GET -Headers $hdr -TimeoutSec 20
+            }
+        }
+
+        $results = @{}
+        try {
+            # Fetch all infraAccBndlGrp (DPC=link, VPC=node)
+            $base = "https://$h"
+            $grpUrl = "$base/api/node/class/infraAccBndlGrp.json?rsp-subtree=full&rsp-subtree-class=infraRsAttEntP"
+            $grpResp = ApicGet $grpUrl $tok $h $ssl
+            $grpMap  = @{}   # name → @{lagT; aepDns=[]}
+            foreach ($item in $grpResp.imdata) {
+                $a    = $item.infraAccBndlGrp.attributes
+                $aeps = @()
+                if ($item.infraAccBndlGrp.children) {
+                    foreach ($ch in $item.infraAccBndlGrp.children) {
+                        if ($ch.infraRsAttEntP) {
+                            $aepDn = $ch.infraRsAttEntP.attributes.tDn
+                            if ($aepDn) { $aeps += $aepDn }
+                        }
+                    }
+                }
+                $grpMap[$a.name] = @{ lagT=$a.lagT; aeps=$aeps }
+            }
+
+            # Fetch all VLAN domains (fvnsVlanInstP)
+            $vdUrl  = "$base/api/node/class/fvnsVlanInstP.json?rsp-prop-include=naming-only"
+            $vdResp = ApicGet $vdUrl $tok $h $ssl
+            $vlanDomains = @()
+            foreach ($item in $vdResp.imdata) {
+                $vlanDomains += $item.fvnsVlanInstP.attributes.name
+            }
+
+            # Fetch AEP → vlan domain associations
+            $aepUrl  = "$base/api/node/class/infraRsDomP.json"
+            $aepResp = ApicGet $aepUrl $tok $h $ssl
+            $aepDomMap = @{}   # aepDn → [domain names]
+            foreach ($item in $aepResp.imdata) {
+                $dn    = $item.infraRsDomP.attributes.dn
+                $tDn   = $item.infraRsDomP.attributes.tDn
+                # dn like: uni/infra/attentp-<AEP>/rsdomP-[uni/...]
+                if ($dn -match 'attentp-([^/]+)/rsdomP') {
+                    $aepName = $Matches[1]
+                    $aepDn   = "uni/infra/attentp-$aepName"
+                    if (-not $aepDomMap.ContainsKey($aepDn)) { $aepDomMap[$aepDn] = @() }
+                    # domain name from tDn: uni/phys-<name> or uni/vmmp-.../dom-<name> or uni/l2dom-<name>
+                    if ($tDn -match '-([^-/]+)$') { $aepDomMap[$aepDn] += $Matches[1] }
+                }
+            }
+
+            foreach ($ckKey in $checks.PSObject.Properties.Name) {
+                $ck     = $checks.$ckKey
+                $port   = $ck.port
+                $type   = $ck.type
+                $tenant = $ck.tenant
+                $lagT   = if ($type -eq 'dpc') { 'link' } else { 'node' }
+
+                if (-not $grpMap.ContainsKey($port)) {
+                    $results[$ckKey] = @{ Valid=$false; Message="policy group '$port' not found on APIC" }
+                    continue
+                }
+                $grp = $grpMap[$port]
+                if ($grp.lagT -ne $lagT) {
+                    $results[$ckKey] = @{ Valid=$false; Message="policy group '$port' is type '$($grp.lagT)' not '$lagT'" }
+                    continue
+                }
+
+                # Check AEP has vlan domain starting with tenant name
+                $domainOk = $false
+                $foundDomains = @()
+                foreach ($aepDn in $grp.aeps) {
+                    if ($aepDomMap.ContainsKey($aepDn)) {
+                        foreach ($dom in $aepDomMap[$aepDn]) {
+                            $foundDomains += $dom
+                            if ($dom -like "$tenant*") { $domainOk = $true }
+                        }
+                    }
+                }
+                if (-not $domainOk) {
+                    $domList = if ($foundDomains.Count -gt 0) { $foundDomains -join ',' } else { 'none' }
+                    $results[$ckKey] = @{ Valid=$false; Message="AEP has no VLAN domain starting with '$tenant' (found: $domList)" }
+                } else {
+                    $results[$ckKey] = @{ Valid=$true; Message="OK" }
+                }
+            }
+        } catch {
+            $results['_error'] = @{ Valid=$false; Message=$_.Exception.Message }
+        }
+        return $results
+    } -ArgumentList $host_, $token, $ssl, ($checks | ConvertTo-Json -Depth 5)
+
+    $res = $job | Wait-Job | Receive-Job -ErrorAction SilentlyContinue
+    Remove-Job $job
+    if ($res) { return $res }
+    return @{}
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  BULK ADVANCED SETTINGS MENU
+# ════════════════════════════════════════════════════════════════════════════════
+
+function Show-BulkAdvancedSettings {
+    while (-not $script:ExitRequested) {
+        $vpLbl  = if ($script:Config.BulkValidatePortPolicy) { "enabled ✔" } else { "disabled ✘" }
+        $tvLbl  = if ($script:Config.BulkValidateTenant -ne $false) { "enabled ✔" } else { "disabled ✘" }
+        $epLbl  = if ($script:Config.BulkLookupEpg -ne $false)      { "enabled ✔" } else { "disabled ✘" }
+
+        $items = @(
+            "Validate port policy (DPC/VPC)  — $vpLbl"
+            "Validate tenant on APIC         — $tvLbl"
+            "Lookup AP/EPG on APIC           — $epLbl"
+        )
+        $sel = Invoke-Menu -Title "⚙  Bulk Advanced Settings  " -Color "Green" -Items $items
+        $backIdx = $items.Count; $backMainIdx = $items.Count + 1; $quitIdx = $items.Count + 2
+        switch ($sel) {
+            0 {
+                $script:Config.BulkValidatePortPolicy = -not $script:Config.BulkValidatePortPolicy
+                Save-Config
+            }
+            1 {
+                if ($script:Config.BulkValidateTenant -ne $false) { $script:Config.BulkValidateTenant = $false }
+                else { $script:Config.BulkValidateTenant = $true }
+                Save-Config
+            }
+            2 {
+                if ($script:Config.BulkLookupEpg -ne $false) { $script:Config.BulkLookupEpg = $false }
+                else { $script:Config.BulkLookupEpg = $true }
+                Save-Config
+            }
+            $backIdx     { return }
+            $backMainIdx { $script:ReturnToMain = $true; return }
+            $quitIdx     { Invoke-Quit; return }
+        }
+    }
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1841,28 +2124,72 @@ function Import-BulkCsv {
 
     # ── 2. Ensure APIC session — auto-login if needed ────────────────────────
     if (-not $script:Session.LoggedIn) {
-        Write-Host ""
-        Write-Host "  🔌  Not logged in — launching login..." -ForegroundColor DarkYellow
-        Write-Host ""
-        Test-ApicLogin
-        if (-not $script:Session.LoggedIn) {
-            Write-Host ""
-            Write-Host "  ⚠  Login failed. Continue without APIC validation? [Y/N] : " -NoNewline -ForegroundColor DarkYellow
+        Write-Host "  🔌  Not logged in — attempting auto-login..." -NoNewline -ForegroundColor DarkYellow
+        $hostPool  = Get-ApicHostPool
+        $loginOk   = $false
+        foreach ($tryHost in $hostPool) {
+            Write-Host "." -NoNewline -ForegroundColor DarkGray
+            $loginJob = Start-Job -ScriptBlock {
+                param($h,$u,$p,$ssl)
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                $body = '{"aaaUser":{"attributes":{"name":"' + $u + '","pwd":"' + $p + '"}}}'
+                try {
+                    if ($PSVersionTable.PSVersion.Major -ge 7) {
+                        $r = Invoke-RestMethod -Uri "https://$h/api/aaaLogin.json" -Method POST -Body $body -ContentType 'application/json' -TimeoutSec 15 -SkipCertificateCheck:(-not $ssl)
+                    } else {
+                        if (-not $ssl) {
+                            if (-not ([System.Management.Automation.PSTypeName]'TrustAllBulkLogin').Type) {
+                                Add-Type @"
+using System.Net; using System.Security.Cryptography.X509Certificates;
+public class TrustAllBulkLogin : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp,X509Certificate c,WebRequest req,int p){return true;} }
+"@
+                            }
+                            [Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllBulkLogin
+                        }
+                        $r = Invoke-RestMethod -Uri "https://$h/api/aaaLogin.json" -Method POST -Body $body -ContentType 'application/json' -TimeoutSec 15
+                    }
+                    $tok = $r.imdata[0].aaaLogin.attributes.token
+                    if ($tok) { return @{Success=$true;Token=$tok;Host=$h} }
+                    return @{Success=$false}
+                } catch { return @{Success=$false;Error=$_.Exception.Message} }
+            } -ArgumentList $tryHost, $script:Config.Username, $script:Config.Password, $script:Config.SSLVerify
+
+            $res = $loginJob | Wait-Job | Receive-Job -ErrorAction SilentlyContinue
+            Remove-Job $loginJob
+            if ($res -and $res.Success) {
+                $script:Session.LoggedIn  = $true
+                $script:Session.Token     = $res.Token
+                $script:Session.Host      = $res.Host
+                $script:Session.Username  = $script:Config.Username
+                $script:Session.SSLVerify = $script:Config.SSLVerify
+                $loginOk = $true
+                break
+            }
+        }
+        if ($loginOk) {
+            Write-Host " ✔  Connected to $($script:Session.Host)" -ForegroundColor Green
+        } else {
+            Write-Host " ✘" -ForegroundColor Red
+            Write-Host "  ⚠  Auto-login failed. Continue without APIC validation? [Y/N] : " -NoNewline -ForegroundColor DarkYellow
             $yn = [Console]::ReadKey($true); Write-Host $yn.KeyChar
             if ($yn.Key -ne 'Y') { Write-Host ""; Wait-AnyKey; return }
         }
+    } else {
+        Write-Host "  🔌  Using active session: $($script:Session.Username)@$($script:Session.Host)" -ForegroundColor DarkGreen
     }
 
     # ── 3. Validate tenants on APIC ──────────────────────────────────────────
     Write-Host "  🔍  Validating tenants on APIC..." -NoNewline -ForegroundColor DarkGray
     $tenantNames = @($rawRows | ForEach-Object { $_['tenant'] } | Where-Object { $_ } | Sort-Object -Unique)
-    if ($script:Session.LoggedIn) {
+    if ($script:Session.LoggedIn -and $script:Config.BulkValidateTenant -ne $false) {
         $tenantValid = Invoke-ApicTenantValidation -Tenants $tenantNames
         Write-Host " ✔" -ForegroundColor Green
     } else {
         $tenantValid = @{}
         foreach ($t in $tenantNames) { $tenantValid[$t] = $null }
-        Write-Host " ⚠  Skipped (no session)" -ForegroundColor DarkYellow
+        if (-not $script:Session.LoggedIn) { Write-Host " ⚠  Skipped (no session)" -ForegroundColor DarkYellow }
+        else                               { Write-Host " ⊘  Disabled in advanced settings" -ForegroundColor DarkGray }
     }
 
     # ── 4. Serialize rows (expand VLANs) ─────────────────────────────────────
@@ -1936,13 +2263,20 @@ function Import-BulkCsv {
 
         # --- Expand one row per VLAN ─────────────────────────────────────────
         foreach ($vlan in $vlanList) {
-            # Determine final mode for this VLAN
-            $finalMode = $modeRaw
+            # native=TRUE  → all rows are native
+            # native=<int> → matching VLAN = native, others = regular
+            # native=FALSE/empty → use declared mode
             if ($nativeBool -eq $true) {
                 $finalMode = 'native'
-            } elseif ($nativeVlan -ne $null -and $vlan -eq $nativeVlan) {
-                $finalMode = 'native'
+            } elseif ($nativeVlan -ne $null) {
+                if ($vlan -eq $nativeVlan) { $finalMode = 'native' }
+                else                       { $finalMode = 'regular' }
+            } else {
+                $finalMode = $modeRaw
             }
+
+            if ($nativeVlan -ne $null) { $nvOut = $nativeVlan } else { $nvOut = 0 }
+            if ($rowValid)             { $vOut  = 1 }           else { $vOut  = 0 }
 
             $serialized.Add(@{
                 src_line    = $srcLine
@@ -1953,21 +2287,40 @@ function Import-BulkCsv {
                 port        = $port
                 vlan        = $vlan
                 mode        = $finalMode
-                native_vlan = if ($nativeVlan -ne $null) { $nativeVlan } else { 0 }
+                native_vlan = $nvOut
                 ap          = ''
                 epg         = ''
-                valid       = if ($rowValid) { 1 } else { 0 }
+                valid       = $vOut
                 errors      = $errStr
             })
         }
     }
     Write-Host " ✔  $($serialized.Count) serialized row(s)" -ForegroundColor Green
 
+    # ── 4b. Duplicate port validation ────────────────────────────────────────
+    Write-Host "  🔍  Checking duplicate ports..." -NoNewline -ForegroundColor DarkGray
+    $portSeen = @{}
+    foreach ($srow in $serialized) {
+        $pk = "$($srow.leaf)|$($srow.port)"
+        if (-not $portSeen.ContainsKey($pk)) {
+            $portSeen[$pk] = $srow.src_line
+        } elseif ($srow.src_line -ne $portSeen[$pk]) {
+            $srow.valid = 0
+            $first = $portSeen[$pk]
+            $dupErr = "duplicate port (first used on src line $first)"
+            if ($srow.errors) { $srow.errors += " | $dupErr" }
+            else              { $srow.errors  = $dupErr }
+        }
+    }
+    $dupCount = ($serialized | Where-Object { $_.errors -like '*duplicate port*' }).Count
+    if ($dupCount -gt 0) { Write-Host " ⚠  $dupCount row(s) invalidated" -ForegroundColor DarkYellow }
+    else                 { Write-Host " ✔  no duplicates" -ForegroundColor Green }
+
     # ── 5. Enrich with AP/EPG from APIC ─────────────────────────────────────
     Write-Host "  🔗  Looking up AP/EPG on APIC..." -NoNewline -ForegroundColor DarkGray
     $validTenants = @($serialized | Where-Object { $_.valid -eq 1 } |
                       ForEach-Object { $_.tenant } | Sort-Object -Unique)
-    if ($script:Session.LoggedIn -and $validTenants.Count -gt 0) {
+    if ($script:Session.LoggedIn -and $validTenants.Count -gt 0 -and $script:Config.BulkLookupEpg -ne $false) {
         $epgMap = Invoke-ApicEpgLookup -Tenants $validTenants
         foreach ($srow in $serialized) {
             if ($srow.valid -ne 1) { continue }
@@ -1985,6 +2338,30 @@ function Import-BulkCsv {
         Write-Host " ✔" -ForegroundColor Green
     } else {
         Write-Host " ⚠  Skipped (not logged in or no valid rows)" -ForegroundColor DarkYellow
+    }
+
+    # ── 5b. Validate DPC/VPC port policy groups ─────────────────────────────
+    $dpcVpcRows = @($serialized | Where-Object { $_.valid -eq 1 -and ($_.type -eq 'dpc' -or $_.type -eq 'vpc') })
+    if ($script:Session.LoggedIn -and $dpcVpcRows.Count -gt 0 -and $script:Config.BulkValidatePortPolicy) {
+        Write-Host "  🔌  Validating DPC/VPC port policies..." -NoNewline -ForegroundColor DarkGray
+        $ppResults = Invoke-ApicPortPolicyValidation -Rows $dpcVpcRows
+        $ppFail = 0
+        foreach ($srow in $serialized) {
+            if ($srow.type -ne 'dpc' -and $srow.type -ne 'vpc') { continue }
+            if ($srow.valid -ne 1) { continue }
+            $ckKey = "$($srow.port)|$($srow.type)|$($srow.tenant)"
+            if ($ppResults.ContainsKey($ckKey) -and $ppResults[$ckKey].Valid -eq $false) {
+                $srow.valid = 0
+                $ppErr = "port policy: $($ppResults[$ckKey].Message)"
+                if ($srow.errors) { $srow.errors += " | $ppErr" }
+                else              { $srow.errors  = $ppErr }
+                $ppFail++
+            }
+        }
+        if ($ppFail -gt 0) { Write-Host " ⚠  $ppFail row(s) failed" -ForegroundColor DarkYellow }
+        else               { Write-Host " ✔" -ForegroundColor Green }
+    } elseif ($dpcVpcRows.Count -gt 0 -and -not $script:Config.BulkValidatePortPolicy) {
+        Write-Host "  🔌  Port policy validation — ⊘ disabled in advanced settings" -ForegroundColor DarkGray
     }
 
     # ── 6. Save to DB ────────────────────────────────────────────────────────
@@ -2048,10 +2425,16 @@ function Show-BulkImportResults {
     param([int]$ImportId)
 
     # Load rows from DB
-    $allRows = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
+    try {
+        $allRows = @(Invoke-SqliteQuery -DataSource $script:DbPath -Query @"
 SELECT id,src_line,tenant,type,pod,leaf,port,vlan,mode,native_vlan,ap,epg,valid,errors
 FROM bulk_import_rows WHERE import_id=@iid ORDER BY src_line,vlan
 "@ -SqlParameters @{iid=$ImportId})
+    } catch {
+        Clear-Host; Write-Header "📋  Import Results" "Green"
+        Write-Host "  ✘  DB query error: $_" -ForegroundColor Red
+        Write-Host ""; Wait-AnyKey; return
+    }
 
     if ($allRows.Count -eq 0) {
         Clear-Host; Write-Header "📋  Import Results" "Green"
@@ -2140,22 +2523,30 @@ FROM bulk_import_rows WHERE import_id=@iid ORDER BY src_line,vlan
                     default   { 'Gray' }
                 }
 
+                if ($isValid) { $vlanColor = 'Yellow' } else { $vlanColor = 'DarkYellow' }
+                if ($r.ap)    { $apColor   = 'DarkCyan' } else { $apColor   = 'DarkGray' }
+                if ($r.epg)   { $epgColor  = 'DarkCyan' } else { $epgColor  = 'DarkGray' }
+
                 Write-Host "  │ " -NoNewline -ForegroundColor DarkGray
                 Write-Host $tTenant -NoNewline -ForegroundColor $tenantC
                 Write-Host " $tType "  -NoNewline -ForegroundColor $rowColor
                 Write-Host "$tPod "    -NoNewline -ForegroundColor $rowColor
                 Write-Host "$tLeaf "   -NoNewline -ForegroundColor $rowColor
                 Write-Host "$tPort "   -NoNewline -ForegroundColor $rowColor
-                Write-Host "$tVlan "   -NoNewline -ForegroundColor (if ($isValid) {'Yellow'} else {'DarkYellow'})
+                Write-Host "$tVlan "   -NoNewline -ForegroundColor $vlanColor
                 Write-Host "$tMode "   -NoNewline -ForegroundColor $modeColor
-                Write-Host "$tAp "     -NoNewline -ForegroundColor (if ($r.ap)  {'DarkCyan'} else {'DarkGray'})
-                Write-Host "$tEpg"     -NoNewline -ForegroundColor (if ($r.epg) {'DarkCyan'} else {'DarkGray'})
+                Write-Host "$tAp "     -NoNewline -ForegroundColor $apColor
+                Write-Host "$tEpg"     -NoNewline -ForegroundColor $epgColor
                 Write-Host "│" -ForegroundColor DarkGray
 
                 # Show error note if invalid
                 if (-not $isValid -and $r.errors) {
-                    $errShort = if ($r.errors.Length -gt $tableInner-4) { $r.errors.Substring(0,$tableInner-7)+'...' } else { $r.errors }
-                    Write-Host "  │  ✘ $($errShort.PadRight($tableInner-4))│" -ForegroundColor Red
+                    if ($r.errors.Length -gt $tableInner - 4) {
+                        $errShort = $r.errors.Substring(0, $tableInner - 7) + '...'
+                    } else {
+                        $errShort = $r.errors
+                    }
+                    Write-Host "  │  ✘ $($errShort.PadRight($tableInner - 4))│" -ForegroundColor Red
                 }
             }
 
@@ -2217,13 +2608,18 @@ function Invoke-BulkStaticPort {
 }
 
 function Show-EndpointGroupsMenu {
-    $items = @("Add static port to EPG","Add bulk static port to EPG via input file")
+    $items = @(
+        "Add static port to EPG"
+        "Add bulk static port to EPG via input file"
+        "Bulk import — Advanced settings"
+    )
     while (-not $script:ExitRequested) {
         $sel = Invoke-Menu -Title "🔗  Endpoint Groups       " -Color "Green" -Items $items
         $backIdx = $items.Count; $backMainIdx = $items.Count + 1; $quitIdx = $items.Count + 2
         switch ($sel) {
             0 { Clear-Host; Write-Header "🔗  Add static port to EPG" "Green"; Write-Host "  → Add single static port (placeholder)" -ForegroundColor Yellow; Wait-AnyKey }
             1 { Invoke-BulkStaticPort }
+            2 { Show-BulkAdvancedSettings; if ($script:ReturnToMain) { return } }
             $backIdx     { return }
             $backMainIdx { $script:ReturnToMain = $true; return }
             $quitIdx     { Invoke-Quit; return }
@@ -2281,7 +2677,8 @@ function Show-SettingsMenu {
         $logoutLbl  = if ($script:Session.LoggedIn) { "APIC Logout         ─ 🔌 $($script:Session.Username)@$($script:Session.Host)" }
                       else                          { "APIC Logout         ─ ⊘ no active session" }
 
-        $inputLbl = if ($script:Config.InputFolder) { $script:Config.InputFolder } else { "(not set)" }
+        $inputLbl  = if ($script:Config.InputFolder) { $script:Config.InputFolder } else { "(not set)" }
+        $auLbl     = if ($script:Config.AutoUpdate) { "enabled ✔" } else { "disabled ✘" }
         $items = @(
             "Bootstrap Host      ─ $hLbl"
             "Set Credentials     ─ $uLbl"
@@ -2292,6 +2689,7 @@ function Show-SettingsMenu {
             "Host Pool           ─ $pLbl"
             "Change DB Folder    ─ $dbS"
             "Input Folder for bulk operation ─ $inputLbl"
+            "Auto-update from GitHub ─ $auLbl"
             "Clean Database      ─ 🗄 clear or delete DB"
         )
         $dis = @()
@@ -2315,7 +2713,8 @@ function Show-SettingsMenu {
             6  { Show-DiscoveredHosts; if ($script:ReturnToMain) { return } }
             7  { Set-DbFolder }
             8  { Set-InputFolder }
-            9  { Clear-Database }
+            9  { $script:Config.AutoUpdate = -not $script:Config.AutoUpdate; Save-Config }
+            10 { Clear-Database }
             $backIdx     { return }
             $backMainIdx { $script:ReturnToMain = $true; return }
             $quitIdx     { Invoke-Quit; return }
@@ -2331,7 +2730,7 @@ function Show-MainMenu {
     $items = @("Configure","Show","Troubleshoot","Settings","Quit")
     while (-not $script:ExitRequested) {
         $script:ReturnToMain = $false
-        switch (Invoke-Menu -Title "🌐  APIC Manager v1.3      " -Color "Cyan" -Items $items -IsMain $true) {
+        switch (Invoke-Menu -Title "🌐  APIC Manager v1.4      " -Color "Cyan" -Items $items -IsMain $true) {
             0 { Show-ConfigureMenu }; 1 { Show-ShowMenu }
             2 { Show-TroubleshootMenu }; 3 { Show-SettingsMenu }; 4 { Invoke-Quit }
         }
@@ -2345,7 +2744,7 @@ function Show-MainMenu {
 Clear-Host
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "  ║   🌐  APIC Manager v1.3          ║" -ForegroundColor Cyan
+Write-Host "  ║   🌐  APIC Manager v1.4          ║" -ForegroundColor Cyan
 Write-Host "  ║   🚀  Starting up...             ║" -ForegroundColor Cyan
 Write-Host "  ╚══════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
@@ -2385,5 +2784,9 @@ if ($dbReady) {
 }
 
 Write-Host ""
-Start-Sleep -Milliseconds 900
+
+# ── GitHub auto-update check ──────────────────────────────────────────────────
+if ($dbReady) { Invoke-AutoUpdate }
+
+Start-Sleep -Milliseconds 600
 Show-MainMenu
